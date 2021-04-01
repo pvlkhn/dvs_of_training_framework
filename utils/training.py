@@ -36,7 +36,8 @@ def predictions2tag(predictions):
 
 def train(model,
           device,
-          loader,
+          train_loader,
+          generated_train_loader,
           optimizer,
           num_steps: int,
           scheduler,
@@ -54,7 +55,8 @@ def train(model,
     Args:
         model (nn.Module): a model to train
         device (torch.device): a device used for training
-        loader (torch.utils.data.DataLoader): a training data loader
+        train_loader (torch.utils.data.DataLoader): a training data loader
+        generated_train_loader (torch.utils.data.DataLoader): a training data loader
         optimzer (torch.optim.optimizer.Optimizer): a used optimizer
         num_steps (int): number of training steps
         scheduler (torch.optimi.lr_scheduler): scheduler that updates lr
@@ -76,110 +78,31 @@ def train(model,
     out_reg_sum = []
     optimizer.zero_grad()
     timers('batch_construction').start()
-    for global_step, (data, start, stop, image1, image2) in enumerate(
-            loader, init_step * accumulation_steps):
-        if global_step == num_steps * accumulation_steps:
-            break
+    for global_step, loaded_data in enumerate(zip(train_loader, train_loader), init_step * accumulation_steps):
         timers('batch_construction').stop()
-        timers('batch2gpu').start()
-        data, start, stop, image1, image2 = map(lambda x: x.to(device),
-                                                (data,
-                                                 start,
-                                                 stop,
-                                                 image1,
-                                                 image2))
-        timers('batch2gpu').stop()
-        shape = image1.size()[-2:]
-        samples_passed += start.numel()
-        timers('forward').start()
-        prediction, features = model(data,
-                                     start,
-                                     stop,
-                                     shape,
-                                     raw=is_raw,
-                                     intermediate=True)
-        tags = predictions2tag(prediction)
-        timers('forward').stop()
-        timers('loss').start()
-        loss, terms = combined_loss(evaluator,
-                                    prediction,
-                                    image1,
-                                    image2,
-                                    features,
-                                    weights=weights)
-        smoothness, photometric, out_reg = terms
-        loss /= accumulation_steps
-        timers('loss').stop()
-        timers('backprop').start()
-        loss.backward()
-        timers('backprop').stop()
+        if global_step == 2 * num_steps * accumulation_steps:
+            break
 
-        is_step_boundary = (global_step + 1) % accumulation_steps == 0
-        if is_step_boundary:
-            timers('optimizer_step').start()
-            optimizer.step()
-            optimizer.zero_grad()
-            timers('optimizer_step').stop()
-            scheduler.step()
+        for is_generated, (events, start, stop, image1, image2) in enumerate(loaded_data):
+            samples_passed += start.numel()
+            events, start, stop, image1, image2 = send_data_on_device(device, events, start, stop, image1, image2, timers)
+            prediction, features, tags = forward_pass(model, events, start, stop, image1, image2, timers, is_raw)
+            loss, terms = compute_losses(evaluator, prediction, accumulation_steps, image1, image2, features, weights, timers)
+            backward_prop(loss, timers)
 
-            timers('logging').start()
-            photo_sum = add_loss(photo_sum, photometric)
-            smooth_sum = add_loss(smooth_sum, smoothness)
-            out_reg_sum = add_loss(out_reg_sum, out_reg)
             loss_sum += loss.item()
+            photo_sum, smooth_sum, out_reg_sum = update_losses(loss, terms, photo_sum, smooth_sum, out_reg_sum, hooks, timers)
 
-            for tag, s, p, o in zip(tags, smooth_sum, photo_sum, out_reg_sum):
-                logger.add_scalar(f'Train/photometric loss/{tag}',
-                                  p / accumulation_steps,
-                                  samples_passed)
-                logger.add_scalar(f'Train/smoothness loss/{tag}',
-                                  s / accumulation_steps,
-                                  samples_passed)
-                logger.add_scalar(f'Train/out regularization/{tag}',
-                                  o / accumulation_steps,
-                                  samples_passed)
-            logger.add_scalar('General/Train loss',
-                              loss_sum,
-                              samples_passed)
-            if is_step_boundary:
-                for i, lr in enumerate([p['lr']
-                                        for p in optimizer.param_groups]):
-                    logger.add_scalar(f'General/learning rate/{i}',
-                                      lr,
-                                      samples_passed)
+            if (global_step + 1) % accumulation_steps == 0:
+                do_optimization_step(optimizer, scheduler, timers)
+                true_step = (global_step + 1) // accumulation_steps
+                dump_losses(loss_sum, smooth_sum, photo_sum, out_reg_sum, samples_passed, tags, optimizer, scheduler, logger, timers)
+                run_hooks(model, hooks, true_step, samples_passed, timers)
+                loss_sum = 0
+                smooth_sum = []
+                photo_sum = []
+                out_reg_sum = []
 
-            loss_sum = 0
-            smooth_sum = []
-            photo_sum = []
-            out_reg_sum = []
-            timers('logging').stop()
-
-            step = (global_step + 1) // accumulation_steps
-            for k, hook in hooks.items():
-                timers(k).start()
-                hook(step, samples_passed)
-                timers(k).stop()
-            # make sure to return to train after all hooks
-            model.train()
-        else:
-            timers('optimizer_step').start()
-            timers('optimizer_step').stop()
-            for k, hook in hooks.items():
-                timers(k).start()
-                timers(k).stop()
-            # losses for logging
-            timers('logging').start()
-            photo_sum = add_loss(photo_sum, photometric)
-            smooth_sum = add_loss(smooth_sum, smoothness)
-            out_reg_sum = add_loss(out_reg_sum, out_reg)
-            loss_sum += loss.item()
-            timers('logging').stop()
-
-        # remove the graph
-        timers('free').start()
-        del prediction
-        del features
-        timers('free').stop()
 
         timers.log(names=['batch_construction',
                           'batch2gpu',
@@ -197,16 +120,119 @@ def train(model,
     timers('batch_construction').stop()
 
 
+def send_data_on_device(device, events, start, stop, image1, image2, timers):
+    timers('batch2gpu').start()
+    events, start, stop, image1, image2 = map(lambda x: x.to(device),
+                                            (events,
+                                             start,
+                                             stop,
+                                             image1,
+                                             image2))
+    timers('batch2gpu').stop()
+    return events, start, stop, image1, image2
+
+def forward_pass(model, events, start, stop, image1, image2, timers, is_raw):
+        shape = image1.size()[-2:]
+        timers('forward').start()
+        prediction, features = model(events,
+                                     start,
+                                     stop,
+                                     shape,
+                                     raw=is_raw,
+                                     intermediate=True)
+        tags = predictions2tag(prediction)
+        timers('forward').stop()
+        return prediction, features, tags
+
+
+def compute_losses(evaluator, prediction, accumulation_steps, image1, image2, features, weights, timers):
+    timers('loss').start()
+    loss, terms = combined_loss(evaluator,
+                                prediction,
+                                image1,
+                                image2,
+                                features,
+                                weights=weights)
+    loss = loss / accumulation_steps
+    terms = [[term_part / accumulation_steps for term_part in term] for term in terms]
+    timers('loss').stop()
+    return loss, terms
+
+
+def backward_prop(loss, timers):
+    timers('backprop').start()
+    loss.backward()
+    timers('backprop').stop()
+
+
+def do_optimization_step(optimizer, scheduler, timers):
+    timers('optimizer_step').start()
+    optimizer.step()
+    optimizer.zero_grad()
+    timers('optimizer_step').stop()
+    scheduler.step()
+
+
+def dump_losses(loss_sum, smooth_sum, photo_sum, out_reg_sum, samples_passed, tags, optimizer, scheduler, logger, timers):
+    timers('logging').start()
+    for tag, s, p, o in zip(tags, smooth_sum, photo_sum, out_reg_sum):
+        logger.add_scalar(f'Train/photometric loss/{tag}',
+                          p,
+                          samples_passed)
+        logger.add_scalar(f'Train/smoothness loss/{tag}',
+                          s,
+                          samples_passed)
+        logger.add_scalar(f'Train/out regularization/{tag}',
+                          o,
+                          samples_passed)
+    logger.add_scalar('General/Train loss',
+                      loss_sum,
+                      samples_passed)
+
+    for i, lr in enumerate([p['lr']
+                            for p in optimizer.param_groups]):
+        logger.add_scalar(f'General/learning rate/{i}',
+                          lr,
+                          samples_passed)
+
+    timers('logging').stop()
+
+
+def run_hooks(model, hooks, true_step, samples_passed, timers):
+    for k, hook in hooks.items():
+        timers(k).start()
+        hook(true_step, samples_passed)
+        timers(k).stop()
+    # make sure to return to train after all hooks
+    model.train()
+
+
+def update_losses(loss, terms, photo_sum, smooth_sum, out_reg_sum, hooks, timers):
+    timers('optimizer_step').start()
+    timers('optimizer_step').stop()
+    for k, hook in hooks.items():
+        timers(k).start()
+        timers(k).stop()
+    # losses for logging
+    timers('logging').start()
+    smoothness, photometric, out_reg = terms
+
+    photo_sum = add_loss(photo_sum, photometric)
+    smooth_sum = add_loss(smooth_sum, smoothness)
+    out_reg_sum = add_loss(out_reg_sum, out_reg)
+    timers('logging').stop()
+    return photo_sum, smooth_sum, out_reg_sum
+
+
 def add_loss(loss_sum, loss_values):
     if len(loss_sum) == 0:
-        return [x.item() for x in loss_values]
-    return [x + y.item() for x, y in zip(loss_sum, loss_values)]
+        return [x.item() if type(x) != int else x for x in loss_values]
+    return [x + (y.item() if type(y) != int else y) for x, y in zip(loss_sum, loss_values)]
 
 
 def validate(model, device, loader, samples_passed,
              logger, evaluator, weights=[0.5, 1, 1], is_raw=True):
     model.eval()
-
     n = len(loader)
     photo_sum = []
     smooth_sum = []
