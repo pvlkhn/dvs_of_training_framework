@@ -13,13 +13,14 @@ def mean(v):
 
 
 def combined_loss(evaluator,
+                  is_generated,
                   flows,
                   image1,
                   image2,
                   features,
                   weights=[0.5, 1, 1]):
     arths = (features[f'dec_flow_arth_{i}'] for i in range(len(flows)))
-    terms = evaluator(flows, image1, image2, arths)
+    terms = evaluator(flows, is_generated, image1, image2, arths)
     loss = sum(map(lambda v, w: w*mean(v), terms, weights))
     return loss, terms
 
@@ -87,7 +88,7 @@ def train(model,
             samples_passed += start.numel()
             events, start, stop, image1, image2 = send_data_on_device(device, events, start, stop, image1, image2, timers)
             prediction, features, tags = forward_pass(model, events, start, stop, image1, image2, timers, is_raw)
-            loss, terms = compute_losses(evaluator, prediction, accumulation_steps, image1, image2, features, weights, timers)
+            loss, terms = compute_losses(evaluator, is_generated, prediction, accumulation_steps, image1, image2, features, weights, timers)
             backward_prop(loss, timers)
 
             loss_sum += loss.item()
@@ -134,20 +135,16 @@ def send_data_on_device(device, events, start, stop, image1, image2, timers):
 def forward_pass(model, events, start, stop, image1, image2, timers, is_raw):
         shape = image1.size()[-2:]
         timers('forward').start()
-        prediction, features = model(events,
-                                     start,
-                                     stop,
-                                     shape,
-                                     raw=is_raw,
-                                     intermediate=True)
+        prediction, features, domain = model(events, start, stop, shape, raw=is_raw, intermediate=True)
         tags = predictions2tag(prediction)
         timers('forward').stop()
         return prediction, features, tags
 
 
-def compute_losses(evaluator, prediction, accumulation_steps, image1, image2, features, weights, timers):
+def compute_losses(evaluator, is_generated, prediction, accumulation_steps, image1, image2, features, weights, timers):
     timers('loss').start()
     loss, terms = combined_loss(evaluator,
+                                is_generated,
                                 prediction,
                                 image1,
                                 image2,
@@ -255,6 +252,7 @@ def validate(model, device, loader, samples_passed,
                                          intermediate=True)
             tags = predictions2tag(prediction)
             loss, terms = combined_loss(evaluator,
+                                        False,
                                         prediction,
                                         image1,
                                         image2,

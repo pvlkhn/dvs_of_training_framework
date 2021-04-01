@@ -181,7 +181,7 @@ class Losses:
         self.losses = [Loss(shape, batch_size, device, timers)
                        for shape in shapes]
 
-    def __call__(self, flows, prev_images, next_images, flow_arths):
+    def __call__(self, flows, is_generated, prev_images, next_images, flow_arths):
         result = []
         for loss, flow, flow_arth in zip(self.losses, flows, flow_arths):
             cur_shape = flow.size()[-2:]
