@@ -57,10 +57,10 @@ def is_inside_docker():
 def choose_data_path(args):
     args.model.mkdir(exist_ok=True, parents=True)
     if is_inside_docker():
-        data_path = Path('/data/training/mvsec')
+        data_path = Path('/data/mvsec')
     else:
         base_dir = (script_dir/'..').resolve()
-        data_path = base_dir/'data'/'training'/'mvsec'
+        data_path = base_dir/'data'/'mvsec'
     args.data_path = data_path
     args.log_path = args.model/'log'
     return args
@@ -93,6 +93,16 @@ def get_common_dataset_params(args):
 def get_trainset_params(args):
     params = get_common_dataset_params(args)
     params.path = args.data_path/'outdoor_day2'
+    params.augmentation = True
+    params.collapse_length = args.cl
+    params.shuffle = True
+    params.infinite = True
+    return params
+
+
+def get_generated_trainset_params(args):
+    params = get_common_dataset_params(args)
+    params.path = args.data_path/'outdoor_day1_generated_fixed'
     params.augmentation = True
     params.collapse_length = args.cl
     params.shuffle = True
@@ -241,7 +251,8 @@ def main():
 
     model = init_model(args, device)
 
-    loader = get_dataloader(get_trainset_params(args))
+    train_loader = get_dataloader(get_trainset_params(args))
+    generated_train_loader = get_dataloader(get_generated_trainset_params(args))
 
     serializer = Serializer(args.model,
                             args.num_checkpoints,
@@ -284,22 +295,23 @@ def main():
 
     hooks['validation'](global_step, samples_passed)
 
-    with Profiler(args.profiling, args.model/'profiling'):
-        train(model,
-              device,
-              loader,
-              optimizer,
-              args.training_steps,
-              scheduler=scheduler,
-              evaluator=losses,
-              logger=logger,
-              weights=args.loss_weights,
-              is_raw=args.is_raw,
-              accumulation_steps=args.accum_step,
-              timers=timers,
-              hooks=periodic_hooks,
-              init_step=global_step,
-              init_samples_passed=samples_passed)
+    # with Profiler(args.profiling, args.model/'profiling'):
+    train(model=model,
+          device=device,
+          train_loader=train_loader,
+          generated_train_loader=generated_train_loader,
+          optimizer=optimizer,
+          num_steps=args.training_steps,
+          scheduler=scheduler,
+          evaluator=losses,
+          logger=logger,
+          weights=args.loss_weights,
+          is_raw=args.is_raw,
+          accumulation_steps=args.accum_step,
+          timers=timers,
+          hooks=periodic_hooks,
+          init_step=global_step,
+          init_samples_passed=samples_passed)
 
     samples = samples_passed + (args.training_steps - global_step) * args.bs
     hooks['serialization'](args.training_steps, samples)

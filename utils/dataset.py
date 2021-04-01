@@ -111,7 +111,10 @@ class DatasetImpl:
                 else:
                     assert stop == float(f['start'][()])
                 image2 = np.array(f['image2'])
-                stop = float(f['stop'][()])
+                if 'stop' in f.keys():
+                    stop = float(f['stop'][()])
+                else:
+                    stop = float(f['end'][()])
         events = np.vstack(events)
         # convert float to list with one element
         start, stop = map(lambda x: [x], (start, stop))
