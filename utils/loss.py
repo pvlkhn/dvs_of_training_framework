@@ -22,7 +22,7 @@ def charbonier_loss(delta,
                     epsilon: float = 1e-3,
                     denominator: Optional[torch.Tensor] = None):
     if delta.numel() == 0:
-        return 0
+        return 0.0
     delta = (delta.pow(2) + epsilon*epsilon).pow(alpha)
     if denominator is None:
         return delta.mean()

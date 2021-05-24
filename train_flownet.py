@@ -36,7 +36,7 @@ def init_losses(shape, batch_size, model, device, timers=FakeTimer()):
         out = model(events,
                     torch.tensor([0], dtype=torch.float32, device=device),
                     torch.tensor([0.04], dtype=torch.float32, device=device),
-                    shape, raw=True)
+                    shape)
     out_shapes = tuple(tuple(flow.shape[2:]) for flow in out)
     return Losses(out_shapes, batch_size, device, timers=timers)
 
@@ -85,14 +85,13 @@ def get_resolution(args):
 
 
 def get_common_dataset_params(args):
-    is_raw = args.is_raw
-    collate_fn = collate_wrapper if is_raw else None
-    return SimpleNamespace(is_raw=is_raw,
-                           collate_fn=collate_fn,
-                           shape=get_resolution(args),
-                           batch_size=args.mbs,
-                           pin_memory=True,
-                           num_workers=args.num_workers)
+    return SimpleNamespace(
+       collate_fn=collate_wrapper,
+       shape=get_resolution(args),
+       batch_size=args.mbs,
+       pin_memory=True,
+       num_workers=args.num_workers
+    )
 
 
 def get_trainset_params(args):
@@ -129,8 +128,7 @@ def get_dataloader(params):
     kwargs = {'path': params.path,
               'shape': params.shape,
               'augmentation': params.augmentation,
-              'collapse_length': params.augmentation,
-              'is_raw': params.is_raw}
+              'collapse_length': params.augmentation}
     loader_kwargs = {}
     if params.infinite:
         dataset = IterableDataset(shuffle=params.shuffle, **kwargs)
@@ -150,7 +148,7 @@ def init_model(args, device):
                            args.flownet_path/'net.py')
     model_kwargs = options2model_kwargs(args)
     model_kwargs = filter_kwargs(module.ModelWithDomainAdoption, model_kwargs)
-    model = module.ModelWithDomainAdoption(device, **model_kwargs)
+    model = module.ModelWithDomainAdoption(device, use_oflow=True, **model_kwargs)
     if args.sp is not None:
         model.load_state_dict(torch.load(args.sp, map_location=device))
     model.to(device)
@@ -214,21 +212,23 @@ def construct_train_tools(args, model, passed_steps=0):
 def create_hooks(args, model, optimizer, losses, logger, serializer):
     device = torch.device(args.device)
     loader = get_dataloader(get_valset_params(args))
-    hooks = {'serialization':
-             lambda steps, samples: serializer.checkpoint_model(
-                 model,
-                 optimizer,
-                 global_step=steps,
-                 samples_passed=samples),
-             'validation': lambda step, samples: validate(
-                 model,
-                 device,
-                 loader,
-                 samples,
-                 logger,
-                 losses,
-                 weights=args.loss_weights,
-                 is_raw=args.is_raw)}
+    hooks = {
+        'serialization': lambda steps, samples: serializer.checkpoint_model(
+             model=model,
+             optimizer=optimizer,
+             global_step=steps,
+             samples_passed=samples
+        ),
+        'validation': lambda step, samples: validate(
+             model=model,
+             device=device,
+             loader=loader,
+             samples_passed=samples,
+             logger=logger,
+             evaluator=losses,
+             weights=args.loss_weights
+        )
+    }
     periods = {'serialization': args.checkpointing_interval,
                'validation': args.vp}
     periodic_hooks = {k: make_hook_periodic(hooks[k], periods[k])
