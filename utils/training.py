@@ -64,7 +64,6 @@ def train(model,
         logger (class): a class to store logs
         evaluator (class): a class to compute loss
         weights (float, float, float): weights of the loss functions
-        is_raw (bool): does use raw event stream
         accumulation_steps (int): gradient accumulation steps
         hooks (dict): hooks that should be called after each step of optimizer.
                       Each hook is a Callable(steps, samples_passed)->None
@@ -79,9 +78,9 @@ def train(model,
     out_reg_sum = []
     optimizer.zero_grad()
     timers('batch_construction').start()
-    for global_step, loaded_data in enumerate(zip(train_loader, train_loader), init_step * accumulation_steps):
+    for global_step, loaded_data in enumerate(zip(train_loader, generated_train_loader), init_step * accumulation_steps):
         timers('batch_construction').stop()
-        if global_step == 2 * num_steps * accumulation_steps:
+        if global_step == num_steps * accumulation_steps:
             break
 
         for is_generated, (events, start, stop, image1, image2) in enumerate(loaded_data):
@@ -89,6 +88,7 @@ def train(model,
             events, start, stop, image1, image2 = send_data_on_device(device, events, start, stop, image1, image2, timers)
             prediction, features, tags = forward_pass(model, events, start, stop, image1, image2, timers, is_raw)
             loss, terms = compute_losses(evaluator, is_generated, prediction, accumulation_steps, image1, image2, features, weights, timers)
+            loss /= accumulation_steps * len(loaded_data)
             backward_prop(loss, timers)
 
             loss_sum += loss.item()
@@ -103,6 +103,10 @@ def train(model,
                 smooth_sum = []
                 photo_sum = []
                 out_reg_sum = []
+            del prediction
+            del features
+            del tags
+            break
 
 
         timers.log(names=['batch_construction',
@@ -135,7 +139,7 @@ def send_data_on_device(device, events, start, stop, image1, image2, timers):
 def forward_pass(model, events, start, stop, image1, image2, timers, is_raw):
         shape = image1.size()[-2:]
         timers('forward').start()
-        prediction, features, domain = model(events, start, stop, shape, raw=is_raw, intermediate=True)
+        prediction, features, domain = model(events, start, stop, shape, intermediate=True, descriminate_domain=True)
         tags = predictions2tag(prediction)
         timers('forward').stop()
         return prediction, features, tags
@@ -223,8 +227,8 @@ def update_losses(loss, terms, photo_sum, smooth_sum, out_reg_sum, hooks, timers
 
 def add_loss(loss_sum, loss_values):
     if len(loss_sum) == 0:
-        return [x.item() if type(x) != int else x for x in loss_values]
-    return [x + (y.item() if type(y) != int else y) for x, y in zip(loss_sum, loss_values)]
+        return [x.item() if type(x) != float else x for x in loss_values]
+    return [x + (y.item() if type(y) != float else y) for x, y in zip(loss_sum, loss_values)]
 
 
 def validate(model, device, loader, samples_passed,
@@ -248,7 +252,6 @@ def validate(model, device, loader, samples_passed,
                                          start,
                                          stop,
                                          shape,
-                                         raw=is_raw,
                                          intermediate=True)
             tags = predictions2tag(prediction)
             loss, terms = combined_loss(evaluator,
